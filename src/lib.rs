@@ -5,10 +5,6 @@ use std::collections::HashSet;
 use std::thread;
 
 use fancy_regex::Regex;
-use pyo3::exceptions;
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
-use pyo3::PyResult;
 use rustc_hash::FxHashMap as HashMap;
 
 fn _byte_pair_merge<T>(
@@ -169,7 +165,6 @@ fn hash_current_thread() -> usize {
 }
 
 const MAX_NUM_THREADS: usize = 128;
-#[pyclass]
 struct CoreBPE {
     encoder: HashMap<Vec<u8>, usize>,
     special_tokens_encoder: HashMap<String, usize>,
@@ -192,19 +187,96 @@ impl CoreBPE {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
     }
 
-    fn _decode_native(&self, tokens: &[usize]) -> Vec<u8> {
-        let mut ret = Vec::with_capacity(tokens.len() * 2);
-        for token in tokens {
-            let token_bytes = self
-                .decoder
-                .get(token)
-                .unwrap_or_else(|| &self.special_tokens_decoder[token]);
-            ret.extend(token_bytes);
+    fn _increase_last_piece_token_len(
+        &self,
+        tokens: Vec<usize>,
+        mut last_piece_token_len: usize,
+    ) -> (Vec<usize>, usize) {
+        // Unfortunately, the locations where our regex splits can be unstable.
+        // For the purposes of determining unstable tokens, unstable regex splitting
+        // is only a problem if a split that was present disappears, since this can
+        // lead to merging of tokens otherwise thought to be stable.
+        // cl100k_base makes our life hard by including the \s*[\r\n]+
+        // pattern. This can e.g. cause "\n" + " " to become "\n \n".
+        // Here is a quick and dirty fix:
+        {
+            let token_is_all_space = |token| {
+                self.decoder
+                    .get(token)
+                    .map(|token_bytes| {
+                        token_bytes
+                            .iter()
+                            .rev()
+                            .all(|&b| [b' ', b'\n', b'\t'].contains(&b))
+                    })
+                    .unwrap_or(false)
+            };
+            if last_piece_token_len > 0
+                && token_is_all_space(&tokens[tokens.len() - last_piece_token_len])
+            {
+                while (last_piece_token_len < tokens.len())
+                    && token_is_all_space(&tokens[tokens.len() - last_piece_token_len - 1])
+                {
+                    last_piece_token_len += 1;
+                }
+            }
         }
-        ret
+        debug_assert!(last_piece_token_len <= tokens.len());
+
+        (tokens, last_piece_token_len)
+    }
+}
+
+impl CoreBPE {
+    pub fn new(
+        encoder: HashMap<Vec<u8>, usize>,
+        special_tokens_encoder: HashMap<String, usize>,
+        pattern: &str,
+    ) -> anyhow::Result<Self> {
+        let regex = Regex::new(pattern)
+            .map_err(|e| anyhow::anyhow!("Invalid regex: {}", e.to_string()))?;
+
+        let special_regex = {
+            let _parts = special_tokens_encoder
+                .keys()
+                .map(|s| fancy_regex::escape(s))
+                .collect::<Vec<_>>();
+            Regex::new(&_parts.join("|"))
+                .map_err(|e| anyhow::anyhow!("Invalid regex: {}", e.to_string()))?
+        };
+
+        let decoder: HashMap<usize, Vec<u8>> =
+            encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
+
+        assert!(encoder.len() == decoder.len());
+
+        let special_tokens_decoder: HashMap<usize, Vec<u8>> = special_tokens_encoder
+            .iter()
+            .map(|(k, v)| (*v, k.as_bytes().to_vec()))
+            .collect();
+
+        // Clone because I don't know how to tell Rust I'm not going to change the map
+        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
+        sorted_token_bytes.sort();
+
+        Ok(CoreBPE {
+            encoder,
+            special_tokens_encoder,
+            decoder,
+            special_tokens_decoder,
+            regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
+            special_regex_tls: (0..MAX_NUM_THREADS)
+                .map(|_| special_regex.clone())
+                .collect(),
+            sorted_token_bytes,
+        })
     }
 
-    fn _encode_ordinary_native(&self, text: &str) -> Vec<usize> {
+    // ====================
+    // Encoding
+    // ====================
+
+    pub fn encode_ordinary(&self, text: &str) -> Vec<usize> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
@@ -220,7 +292,7 @@ impl CoreBPE {
         ret
     }
 
-    fn _encode_native(&self, text: &str, allowed_special: &HashSet<&str>) -> (Vec<usize>, usize) {
+    pub fn encode(&self, text: &str, allowed_special: HashSet<&str>) -> (Vec<usize>, usize) {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
         let mut ret = vec![];
@@ -276,51 +348,37 @@ impl CoreBPE {
         (ret, last_piece_token_len)
     }
 
-    fn _increase_last_piece_token_len(
-        &self,
-        tokens: Vec<usize>,
-        mut last_piece_token_len: usize,
-    ) -> (Vec<usize>, usize) {
-        // Unfortunately, the locations where our regex splits can be unstable.
-        // For the purposes of determining unstable tokens, unstable regex splitting
-        // is only a problem if a split that was present disappears, since this can
-        // lead to merging of tokens otherwise thought to be stable.
-        // cl100k_base makes our life hard by including the \s*[\r\n]+
-        // pattern. This can e.g. cause "\n" + " " to become "\n \n".
-        // Here is a quick and dirty fix:
-        {
-            let token_is_all_space = |token| {
-                self.decoder
-                    .get(token)
-                    .map(|token_bytes| {
-                        token_bytes
-                            .iter()
-                            .rev()
-                            .all(|&b| [b' ', b'\n', b'\t'].contains(&b))
-                    })
-                    .unwrap_or(false)
-            };
-            if last_piece_token_len > 0
-                && token_is_all_space(&tokens[tokens.len() - last_piece_token_len])
-            {
-                while (last_piece_token_len < tokens.len())
-                    && token_is_all_space(&tokens[tokens.len() - last_piece_token_len - 1])
-                {
-                    last_piece_token_len += 1;
+    fn _encode_bytes(&self, bytes: &[u8]) -> Vec<usize> {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => self.encode_ordinary(text),
+            Err(e) => {
+                let text = unsafe { std::str::from_utf8_unchecked(&bytes[..e.valid_up_to()]) };
+                let (tokens, last_piece_token_len) = self.encode(text, HashSet::new());
+                let (mut tokens, last_piece_token_len) =
+                    self._increase_last_piece_token_len(tokens, last_piece_token_len);
+                if !tokens.is_empty() && last_piece_token_len > 0 {
+                    // Lop off the tokens from the last piece and run BPE on the remaining bytes
+                    // Somewhat niche, but this may not be correct if we'd have had a regex
+                    // split between the valid UTF-8 and the invalid bytes, which is why this
+                    // method is private
+                    let mut unstable_bytes =
+                        self.decode_bytes(&tokens[tokens.len() - last_piece_token_len..]);
+                    unstable_bytes.extend_from_slice(&bytes[e.valid_up_to()..]);
+
+                    tokens.truncate(tokens.len() - last_piece_token_len);
+                    tokens.extend(byte_pair_encode(&unstable_bytes, &self.encoder));
                 }
+                tokens
             }
         }
-        debug_assert!(last_piece_token_len <= tokens.len());
-
-        (tokens, last_piece_token_len)
     }
 
-    fn _encode_unstable_native(
+    pub fn encode_with_unstable(
         &self,
         text: &str,
-        allowed_special: &HashSet<&str>,
+        allowed_special: HashSet<&str>,
     ) -> (Vec<usize>, HashSet<Vec<usize>>) {
-        let (tokens, last_piece_token_len) = self._encode_native(text, allowed_special);
+        let (tokens, last_piece_token_len) = self.encode(text, allowed_special);
         if last_piece_token_len == 0 {
             // If last_piece_token_len is zero, the last token was a special token and we have
             // no unstable bytes
@@ -329,7 +387,7 @@ impl CoreBPE {
         let (mut tokens, last_piece_token_len) =
             self._increase_last_piece_token_len(tokens, last_piece_token_len);
 
-        let unstable_bytes = self._decode_native(&tokens[tokens.len() - last_piece_token_len..]);
+        let unstable_bytes = self.decode_bytes(&tokens[tokens.len() - last_piece_token_len..]);
         tokens.truncate(tokens.len() - last_piece_token_len);
 
         // TODO: we should try harder to find additional stable tokens
@@ -377,7 +435,7 @@ impl CoreBPE {
                     // So convert to UTF-8 and do regex splitting.
                     // E.g. with cl100k_base "  !" gets split to " " + " !",
                     // but byte_pair_encode("  !") != byte_pair_encode(" ")
-                    Ok(s) => self._encode_ordinary_native(s),
+                    Ok(s) => self.encode_ordinary(s),
 
                     // Technically, whether or not this arm is correct depends on whether there
                     // would be a regex split before the UTF-8 truncation point.
@@ -430,108 +488,8 @@ impl CoreBPE {
 
         (tokens, completions)
     }
-}
 
-#[pymethods]
-impl CoreBPE {
-    #[new]
-    fn new(
-        encoder: HashMap<Vec<u8>, usize>,
-        special_tokens_encoder: HashMap<String, usize>,
-        pattern: &str,
-    ) -> PyResult<Self> {
-        let regex = Regex::new(pattern)
-            .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?;
-
-        let special_regex = {
-            let _parts = special_tokens_encoder
-                .keys()
-                .map(|s| fancy_regex::escape(s))
-                .collect::<Vec<_>>();
-            Regex::new(&_parts.join("|"))
-                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?
-        };
-
-        let decoder: HashMap<usize, Vec<u8>> =
-            encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
-
-        assert!(encoder.len() == decoder.len());
-
-        let special_tokens_decoder: HashMap<usize, Vec<u8>> = special_tokens_encoder
-            .iter()
-            .map(|(k, v)| (*v, k.as_bytes().to_vec()))
-            .collect();
-
-        // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
-        sorted_token_bytes.sort();
-
-        Ok(CoreBPE {
-            encoder,
-            special_tokens_encoder,
-            decoder,
-            special_tokens_decoder,
-            regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
-            special_regex_tls: (0..MAX_NUM_THREADS)
-                .map(|_| special_regex.clone())
-                .collect(),
-            sorted_token_bytes,
-        })
-    }
-
-    // ====================
-    // Encoding
-    // ====================
-
-    fn encode_ordinary(&self, py: Python, text: &str) -> Vec<usize> {
-        py.allow_threads(|| self._encode_ordinary_native(text))
-    }
-
-    fn encode(&self, py: Python, text: &str, allowed_special: HashSet<&str>) -> Vec<usize> {
-        py.allow_threads(|| self._encode_native(text, &allowed_special).0)
-    }
-
-    fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<usize> {
-        py.allow_threads(|| {
-            match std::str::from_utf8(bytes) {
-                Ok(text) => self._encode_ordinary_native(text),
-                Err(e) => {
-                    let text = unsafe { std::str::from_utf8_unchecked(&bytes[..e.valid_up_to()]) };
-                    let (tokens, last_piece_token_len) = self._encode_native(text, &HashSet::new());
-                    let (mut tokens, last_piece_token_len) =
-                        self._increase_last_piece_token_len(tokens, last_piece_token_len);
-                    if !tokens.is_empty() && last_piece_token_len > 0 {
-                        // Lop off the tokens from the last piece and run BPE on the remaining bytes
-                        // Somewhat niche, but this may not be correct if we'd have had a regex
-                        // split between the valid UTF-8 and the invalid bytes, which is why this
-                        // method is private
-                        let mut unstable_bytes =
-                            self._decode_native(&tokens[tokens.len() - last_piece_token_len..]);
-                        unstable_bytes.extend_from_slice(&bytes[e.valid_up_to()..]);
-
-                        tokens.truncate(tokens.len() - last_piece_token_len);
-                        tokens.extend(byte_pair_encode(&unstable_bytes, &self.encoder));
-                    }
-                    tokens
-                }
-            }
-        })
-    }
-
-    fn encode_with_unstable(
-        &self,
-        py: Python,
-        text: &str,
-        allowed_special: HashSet<&str>,
-    ) -> Py<PyTuple> {
-        let (tokens, completions) =
-            py.allow_threads(|| self._encode_unstable_native(text, &allowed_special));
-        let py_completions =
-            PyList::new(py, completions.iter().map(|seq| PyList::new(py, &seq[..])));
-        (tokens, py_completions).into_py(py)
-    }
-
-    fn encode_single_token(&self, piece: &[u8]) -> PyResult<usize> {
+    pub fn encode_single_token(&self, piece: &[u8]) -> anyhow::Result<usize> {
         if let Some(token) = self.encoder.get(piece).copied() {
             return Ok(token);
         }
@@ -540,10 +498,10 @@ impl CoreBPE {
                 return Ok(token);
             }
         }
-        Err(PyErr::new::<exceptions::PyKeyError, _>(piece.to_owned()))
+        Err(anyhow::anyhow!("Piece {:?} not found", piece))
     }
 
-    fn encode_single_piece(&self, piece: &[u8]) -> Vec<usize> {
+    pub fn encode_single_piece(&self, piece: &[u8]) -> Vec<usize> {
         if let Some(token) = self.encoder.get(piece) {
             return vec![*token];
         }
@@ -554,37 +512,35 @@ impl CoreBPE {
     // Decoding
     // ====================
 
-    fn decode_bytes(&self, py: Python, tokens: Vec<usize>) -> Py<PyBytes> {
-        let bytes = py.allow_threads(|| self._decode_native(&tokens));
-        PyBytes::new(py, &bytes).into()
+    pub fn decode_bytes(&self, tokens: &[usize]) -> Vec<u8> {
+        let mut ret = Vec::with_capacity(tokens.len() * 2);
+        for token in tokens {
+            let token_bytes = self
+                .decoder
+                .get(token)
+                .unwrap_or_else(|| &self.special_tokens_decoder[token]);
+            ret.extend(token_bytes);
+        }
+        ret
     }
 
-    fn decode_single_token_bytes(&self, py: Python, token: usize) -> PyResult<Py<PyBytes>> {
+    pub fn decode_single_token_bytes(&self, token: usize) -> anyhow::Result<&Vec<u8>> {
         if let Some(bytes) = self.decoder.get(&token) {
-            return Ok(PyBytes::new(py, bytes).into());
+            return Ok(bytes);
         }
         if let Some(bytes) = self.special_tokens_decoder.get(&token) {
-            return Ok(PyBytes::new(py, bytes).into());
+            return Ok(bytes);
         }
-        Err(PyErr::new::<exceptions::PyKeyError, _>(token.to_string()))
+        Err(anyhow::anyhow!("Token {} not found", token))
     }
 
     // ====================
     // Miscellaneous
     // ====================
 
-    fn token_byte_values(&self, py: Python) -> Vec<Py<PyBytes>> {
-        self.sorted_token_bytes
-            .iter()
-            .map(|x| PyBytes::new(py, x).into())
-            .collect()
+    pub fn token_byte_values(&self) -> &Vec<Vec<u8>> {
+        &self.sorted_token_bytes
     }
-}
-
-#[pymodule]
-fn _tiktoken(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<CoreBPE>()?;
-    Ok(())
 }
 
 #[cfg(test)]
