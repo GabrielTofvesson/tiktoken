@@ -1,6 +1,8 @@
 // This check is new and seems buggy (possibly with PyO3 interaction)
 #![allow(clippy::borrow_deref_ref)]
 
+pub mod model;
+
 use std::collections::HashSet;
 use std::thread;
 
@@ -165,7 +167,7 @@ fn hash_current_thread() -> usize {
 }
 
 const MAX_NUM_THREADS: usize = 128;
-struct CoreBPE {
+pub struct CoreBPE {
     encoder: HashMap<Vec<u8>, usize>,
     special_tokens_encoder: HashMap<String, usize>,
     decoder: HashMap<usize, Vec<u8>>,
@@ -545,6 +547,9 @@ impl CoreBPE {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use bstr::ByteSlice;
     use rustc_hash::FxHashMap as HashMap;
 
     use crate::byte_pair_split;
@@ -557,5 +562,49 @@ mod tests {
 
         let res = byte_pair_split(b"abcd", &ranks);
         assert_eq!(res, vec![b"ab", b"cd"]);
+    }
+
+    #[tokio::test]
+    async fn test_load_model() {
+        let model = crate::model::model_gpt2().await;
+        assert!(model.is_ok(), "Could not download model (model_gpt2): {:?}", model);
+
+        let model = crate::model::gpt2(model.unwrap());
+        assert!(model.is_ok(), "Could not load model (gpt2): {:?}", model.err().unwrap());
+
+        let model = crate::model::model_cl100k_base().await;
+        assert!(model.is_ok(), "Could not download model (model_cl100k_base): {:?}", model);
+
+        let model = crate::model::cl100k_base(model.unwrap());
+        assert!(model.is_ok(), "Could not load model (cl100k_base): {:?}", model.err().unwrap());
+
+        let model = crate::model::model_p50k_base().await;
+        assert!(model.is_ok(), "Could not download model (model_p50k_base): {:?}", model);
+
+        let model = crate::model::p50k_base(model.unwrap());
+        assert!(model.is_ok(), "Could not load model (p50k_base): {:?}", model.err().unwrap());
+
+        let model = crate::model::model_p50k_edit().await;
+        assert!(model.is_ok(), "Could not download model (model_p50k_edit): {:?}", model);
+
+        let model = crate::model::p50k_edit(model.unwrap());
+        assert!(model.is_ok(), "Could not load model (p50k_edit): {:?}", model.err().unwrap());
+
+        let model = crate::model::model_r50k_base().await;
+        assert!(model.is_ok(), "Could not download model (model_r50k_base): {:?}", model);
+
+        let model = crate::model::r50k_base(model.unwrap());
+        assert!(model.is_ok(), "Could not load model (r50k_base): {:?}", model.err().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_model_encode_decode() {
+        let model = crate::model::cl100k_base(crate::model::model_cl100k_base().await.unwrap()).unwrap();
+        let input = "This is a test";
+        let (encoded, _) = model.encode(input, model.special_tokens_encoder.keys().map(|entry| entry.as_str()).collect::<HashSet<&str>>());
+        let decoded = model.decode_bytes(&encoded);
+        let decoded_string = decoded.to_str();
+        assert!(decoded_string.is_ok(), "Decoding failed: {:?}", decoded);
+        assert_eq!(input.to_string(), decoded_string.unwrap().to_string());
     }
 }
